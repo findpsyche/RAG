@@ -488,5 +488,201 @@ for entity in all_entities:
 
 
 '''
-导入
+导入neo4j
 '''
+query = (
+        "MERGE (a:Entity {name: $subject_name, description: $subject_desc, chunks_id: $subject_chunks_id, entity_id: $subject_entity_id}) "
+        "MERGE (b:Entity {name: $object_name, description: $object_desc, chunks_id: $object_chunks_id, entity_id: $object_entity_id}) "
+        "MERGE (a)-[r:Relationship {name: $predicate}]->(b) "
+        "RETURN a, b, r"
+    )
+'''
+提取上面三元组信息，到query
+'''
+def create_triplet(self, subject: dict, predicate, object: dict) -> None:
+    """
+    创建一个三元组（Triplet）并将其存储到Neo4j数据库中。
+
+    参数:
+    - subject: 主题实体的字典，包含名称、描述、块ID和实体ID
+    - predicate: 关系名称
+    - object: 对象实体的字典，包含名称、描述、块ID和实体ID
+
+    返回:
+    - 查询结果
+    """
+    # 定义Cypher查询语句，用于创建或合并实体节点和关系
+    query = (
+        "MERGE (a:Entity {name: $subject_name, description: $subject_desc, chunks_id: $subject_chunks_id, entity_id: $subject_entity_id}) "
+        "MERGE (b:Entity {name: $object_name, description: $object_desc, chunks_id: $object_chunks_id, entity_id: $object_entity_id}) "
+        "MERGE (a)-[r:Relationship {name: $predicate}]->(b) "
+        "RETURN a, b, r"
+    )
+
+    # 使用数据库会话执行查询
+    with self.driver.session() as session:
+        result = session.run(
+            query,
+            subject_name=subject["name"],
+            subject_desc=subject["description"],
+            subject_chunks_id=subject["chunks id"],
+            subject_entity_id=subject["entity id"],
+            object_name=object["name"],
+            object_desc=object["description"],
+            object_chunks_id=object["chunks id"],
+            object_entity_id=object["entity id"],
+            predicate=predicate,
+        )
+
+    return
+
+for triplet in all_triplets:
+    subject_id = triplet["subject_id"]
+    object_id = triplet["object_id"]
+
+    subject = entity_map.get(subject_id)
+    object = entity_map.get(object_id)
+    if subject and object:
+        self.create_triplet(subject, triplet["predicate"], object)
+
+'''
+社区检测
+'''
+def detect_communities(self) -> None:
+    query = """
+    CALL gds.graph.project(
+        'graph_help',
+        ['Entity'],
+        {
+            Relationship: {
+                orientation: 'UNDIRECTED'
+            }
+        }
+    )
+    """
+    with self.driver.session() as session:
+        result = session.run(query)
+
+    query = """
+    CALL gds.leiden.write('graph_help', {
+        writeProperty: 'communityIds',
+        includeIntermediateCommunities: True,
+        maxLevels: 10,
+        tolerance: 0.0001,
+        gamma: 1.0,
+        theta: 0.01
+    })
+    YIELD communityCount, modularity, modularities
+    """
+    with self.driver.session() as session:
+        result = session.run(query)
+        for record in result:
+            print(
+                f"社区数量: {record['communityCount']}, 模块度: {record['modularity']}"
+            )
+        session.run("CALL gds.graph.drop('graph_help')")
+
+'''
+检测后生成schema
+'''
+def gen_community_schema(self) -> dict[str, dict]:
+    results = defaultdict(
+        lambda: dict(
+            level=None,
+            title=None,
+            edges=set(),
+            nodes=set(),
+            chunk_ids=set(),
+            sub_communities=[],
+        )
+    )
+
+    with self.driver.session() as session:
+        # Fetch community data
+        result = session.run(
+            f"""
+            MATCH (n:Entity)
+            WITH n, n.communityIds AS communityIds, [(n)-[]-(m:Entity) | m.entity_id] AS connected_nodes
+            RETURN n.entity_id AS node_id,
+                    communityIds AS cluster_key,
+                    connected_nodes
+            """
+        )
+
+        max_num_ids = 0
+        for record in result:
+            for index, c_id in enumerate(record["cluster_key"]):
+                node_id = str(record["node_id"])
+                level = index
+                cluster_key = str(c_id)
+                connected_nodes = record["connected_nodes"]
+
+                results[cluster_key]["level"] = level
+                results[cluster_key]["title"] = f"Cluster {cluster_key}"
+                results[cluster_key]["nodes"].add(node_id)
+                results[cluster_key]["edges"].update(
+                    [
+                        tuple(sorted([node_id, str(connected)]))
+                        for connected in connected_nodes
+                        if connected != node_id
+                    ]
+                )
+        for k, v in results.items():
+            v["edges"] = [list(e) for e in v["edges"]]
+            v["nodes"] = list(v["nodes"])
+            v["chunk_ids"] = list(v["chunk_ids"])
+        for cluster in results.values():
+            cluster["sub_communities"] = [
+                sub_key
+                for sub_key, sub_cluster in results.items()
+                if sub_cluster["level"] > cluster["level"]
+                and set(sub_cluster["nodes"]).issubset(set(cluster["nodes"]))
+            ]
+
+    return dict(results)
+'''
+社区摘要
+'''
+def generate_community_report(self):
+    communities_schema = self.read_community_schema()
+    for community_key, community in tqdm(
+        communities_schema.items(), desc="generating community report"
+    ):
+        community["report"] = self.gen_single_community_report(community)
+    with open(self.community_path, "w", encoding="utf-8") as file:
+        json.dump(communities_schema, file, indent=4)
+    print("All community report has been generated.")
+
+def gen_single_community_report(self, community: dict):
+    nodes = community["nodes"]
+    edges = community["edges"]
+    nodes_describe = []
+    edges_describe = []
+    for i in nodes:
+        node = self.get_node_by_id(i)
+        nodes_describe.append({"name": node["name"], "desc": node["description"]})
+    for i in edges:
+        edge = self.get_edges_by_id(i[0], i[1])
+        edges_describe.append(
+            {"source": edge["src"], "target": edge["tar"], "desc": edge["r"]}
+        )
+    nodes_csv = "entity,description\n"
+    for node in nodes_describe:
+        nodes_csv += f"{node['name']},{node['desc']}\n"
+    edges_csv = "source,target,description\n"
+    for edge in edges_describe:
+        edges_csv += f"{edge['source']},{edge['target']},{edge['desc']}\n"
+    data = f"""
+    Text:
+    -----Entities-----
+    ```csv
+    {nodes_csv}
+    ```
+    -----Relationships-----
+    ```csv
+    {edges_csv}
+    ```
+    """
+    prompt = GEN_COMMUNITY_REPORT.format(input_text=data)
+    report = self.llm.predict(prompt)
+    return report
